@@ -32,8 +32,9 @@ REGISTER_KERNEL_TYPED(float)
 REGISTER_KERNEL_TYPED(MLFloat16)
 
 template <typename T>
-LongformerAttention<T>::LongformerAttention(const OpKernelInfo& info) : CudaKernel(info), LongformerAttentionBase(info) {
-  use_compact_memory_ = ParseEnvironmentVariableWithDefault<bool>(longformer::kUseCompactMemory, false);
+LongformerAttention<T>::LongformerAttention(const OpKernelInfo& info)
+  : CudaKernel(info), LongformerAttentionBase(info) {
+  use_compact_memory_ = ParseEnvironmentVariableWithDefault<bool>(longformer::kUseCompactMemory, true);
 }
 
 template <typename T>
@@ -75,7 +76,7 @@ Status LongformerAttention<T>::ComputeInternal(OpKernelContext* context) const {
 
   BuildGlobalIndex(
       stream,
-      global_attention->template Data<int>(),
+      global_attention->Data<int>(),
       batch_size,
       sequence_length,
       global_index_buffer.get(),
@@ -87,7 +88,11 @@ Status LongformerAttention<T>::ComputeInternal(OpKernelContext* context) const {
   size_t pinned_buffer_bytes = GetPinnedBufferSize(batch_size);
   auto pinned_buffer = AllocateBufferOnCPUPinned<void>(pinned_buffer_bytes);
   int* batch_global_num_pinned = reinterpret_cast<int*>(pinned_buffer.get());
-  CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(batch_global_num_pinned, batch_global_num_buffer.get(), batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream));
+  CUDA_RETURN_IF_ERROR(cudaMemcpyAsync(batch_global_num_pinned,
+                                       batch_global_num_buffer.get(),
+                                       batch_size * sizeof(int),
+                                       cudaMemcpyDeviceToHost,
+                                       stream));
 
   // Create an event to make sure the async copy is finished before reading the data.
   AutoDestoryCudaEvent new_event;
@@ -102,7 +107,7 @@ Status LongformerAttention<T>::ComputeInternal(OpKernelContext* context) const {
   int k = hidden_size;
 
   size_t qkv_size = batch_size * sequence_length * 3 * hidden_size * element_size;
-  auto gemm_buffer = GetScratchBuffer<T>(qkv_size);
+  auto gemm_buffer = GetScratchBuffer<void>(qkv_size);
 
   typedef typename ToCudaType<T>::MappedType CudaT;
   CudaT one = ToCudaType<T>::FromFloat(1.0f);
@@ -112,15 +117,15 @@ Status LongformerAttention<T>::ComputeInternal(OpKernelContext* context) const {
   auto& device_prop = GetDeviceProp();
   CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
       cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, 1, &one,
-      reinterpret_cast<const CudaT*>(bias->template Data<T>()), n,
+      reinterpret_cast<const CudaT*>(bias->Data<T>()), n,
       GetConstOnes<CudaT>(m), 1,
       &zero, reinterpret_cast<CudaT*>(gemm_buffer.get()), n, device_prop));
 
   // Gemm, note that CUDA assumes col-major, so result(N, M) = 1 * weights x input + 1 x B.
   CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
       cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one,
-      reinterpret_cast<const CudaT*>(weights->template Data<T>()), n,
-      reinterpret_cast<const CudaT*>(input->template Data<T>()), k,
+      reinterpret_cast<const CudaT*>(weights->Data<T>()), n,
+      reinterpret_cast<const CudaT*>(input->Data<T>()), k,
       &one, reinterpret_cast<CudaT*>(gemm_buffer.get()), n, device_prop));
 
   // Wait for async copy of batch_global_num
@@ -134,46 +139,53 @@ Status LongformerAttention<T>::ComputeInternal(OpKernelContext* context) const {
     }
   }
 
-  // Force to use fast kernel in two situations:
-  // (1) global tokens > windows size. In that case, compact memory kernel cannot be used.
-  // (2) sequence_length == 2 * attention_window. Use fast kernel to walk around parity issue of compact memory kernel.
-  // In other case, we will choose according to user's environment variable setting (default is fast kernel).
-  bool use_fast_kernel = (max_num_global > window_ || sequence_length == 2 * window_ || !use_compact_memory_);
+  // Do not use compact kernel in the following situations:
+  // (1) global tokens > windows size, compact memory kernel cannot be used due to its assumptions.
+  // (2) sequence_length == 2 * attention_window, compact memory kernel has parity issue.
+  // (3) user sets environment variable ORT_LONGFORMER_COMPACT_MEMORY=0
+  bool disable_compact_memory = (max_num_global > window_ || sequence_length == 2 * window_ || !use_compact_memory_);
 
   // Fully connection for global projection.
   // Note that Q only need handle global query tokens if we split GEMM to global Q/K/V separately.
   // When there is no global token, need not run glboal GEMM.
-  auto global_gemm_buffer = GetScratchBuffer<T>(max_num_global > 0 ? qkv_size : 0);
+  auto global_gemm_buffer = GetScratchBuffer<void>(max_num_global > 0 ? qkv_size : 0);
 
   if (max_num_global > 0) {
     CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
         cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, 1, &one,
-        reinterpret_cast<const CudaT*>(global_bias->template Data<T>()), n,
+        reinterpret_cast<const CudaT*>(global_bias->Data<T>()), n,
         GetConstOnes<CudaT>(m), 1,
         &zero, reinterpret_cast<CudaT*>(global_gemm_buffer.get()), n, device_prop));
 
     CUBLAS_RETURN_IF_ERROR(cublasGemmHelper(
         cublas, CUBLAS_OP_N, CUBLAS_OP_N, n, m, k, &one,
-        reinterpret_cast<const CudaT*>(global_weights->template Data<T>()), n,
-        reinterpret_cast<const CudaT*>(input->template Data<T>()), k,
+        reinterpret_cast<const CudaT*>(global_weights->Data<T>()), n,
+        reinterpret_cast<const CudaT*>(input->Data<T>()), k,
         &one, reinterpret_cast<CudaT*>(global_gemm_buffer.get()), n, device_prop));
   }
 
-  size_t workSpaceSize = GetLongformerAttentionWorkspaceSize(element_size, batch_size, num_heads_, head_size, sequence_length, max_num_global, window_, use_fast_kernel);
+  size_t workSpaceSize = GetLongformerAttentionWorkspaceSize(element_size,
+                                                             batch_size,
+                                                             num_heads_,
+                                                             head_size,
+                                                             sequence_length,
+                                                             max_num_global,
+                                                             window_,
+                                                             disable_compact_memory);
   auto workspace_buffer = GetScratchBuffer<void>(workSpaceSize);
   if (!LaunchLongformerAttentionKernel(
           device_prop,
           cublas,
           stream,
           reinterpret_cast<const CudaT*>(gemm_buffer.get()),
-          reinterpret_cast<const CudaT*>(mask->template Data<T>()),
+          reinterpret_cast<const CudaT*>(mask->Data<T>()),
           reinterpret_cast<const CudaT*>(global_gemm_buffer.get()),
-          global_attention->template Data<int>(),
+          global_attention->Data<int>(),
           global_index_buffer.get(),
           batch_global_num_buffer.get(),
           pinned_buffer.get(),
           workspace_buffer.get(),
-          output->template MutableData<T>(),
+          output->MutableData<T>(),
           batch_size,
           sequence_length,
           num_heads_,
@@ -181,14 +193,15 @@ Status LongformerAttention<T>::ComputeInternal(OpKernelContext* context) const {
           window_,
           max_num_global,
           element_size,
-          use_fast_kernel)) {
+          disable_compact_memory)) {
     // Get last error to reset it to cudaSuccess.
     CUDA_CALL(cudaGetLastError());
     return Status(common::ONNXRUNTIME, common::FAIL);
   }
 
-  CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
+  // Defer release of pinnned memory since cudaStreamSynchronize is not used here and kernel need access the buffer.
   this->AddDeferredReleaseCPUPtr(pinned_buffer.release());
+
   return Status::OK();
 }
 
